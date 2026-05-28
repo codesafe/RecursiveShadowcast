@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 
 static const int MAX_W = 256;
 static const int MAX_H = 128;
@@ -90,91 +91,117 @@ static inline bool blocks_move(char c)
     return c == '#' || c == '*';
 }
 
-// Recursive shadowcasting (Björn Bergström). Processes one octant per call.
-// Transform table maps (row, col) in the canonical octant to world deltas.
-static const int OCTANT_XFORM[8][4] = 
+struct ShadowQuadrant
 {
-    { 1,  0,  0,  1},
-    { 0,  1,  1,  0},
-    { 0, -1,  1,  0},
-    {-1,  0,  0,  1},
-    {-1,  0,  0, -1},
-    { 0, -1, -1,  0},
-    { 0,  1, -1,  0},
-    { 1,  0,  0, -1},
+    int xx, xy;
+    int yx, yy;
 };
 
-static void cast_light(int row, double start_slope, double end_slope, int radius, int xx, int xy, int yx, int yy)
+struct ShadowRow
 {
-    if (start_slope < end_slope) return;
+    int depth;
+    double start_slope;
+    double end_slope;
+};
 
-    const int R2 = radius * radius;
-    double next_start = start_slope;
-    bool prev_blocked = false;
+static inline bool in_bounds(int x, int y)
+{
+    return x >= 0 && x < g_W && y >= 0 && y < g_H;
+}
 
-    for (int dist = row; dist <= radius; ++dist)
+static inline int round_ties_up(double value)
+{
+    // Symmetric Shadowcasting 논문/예제에서 쓰는 "0.5는 위로" 반올림이다.
+    // 행의 시작 열을 정할 때 좌우 대칭이 깨지지 않게 해 준다.
+    return (int)std::floor(value + 0.5);
+}
+
+static inline int round_ties_down(double value)
+{
+    // 끝 열은 "0.5는 아래로" 반올림한다.
+    // 시작 열과 짝을 이루어 같은 각도의 타일을 중복/누락 없이 스캔한다.
+    return (int)std::ceil(value - 0.5);
+}
+
+static inline double tile_slope(int depth, int col)
+{
+    // 현재 타일의 왼쪽 가장자리 기울기다.
+    // 벽을 만났을 때 다음 행의 end_slope로 넘겨 그림자 영역을 잘라낸다.
+    return (2.0 * col - 1.0) / (2.0 * depth);
+}
+
+static void transform_quadrant(const ShadowQuadrant& q, int depth, int col, int& x, int& y)
+{
+    // depth는 광원에서 바깥으로 나가는 행 번호, col은 그 행 안의 좌우 위치다.
+    // 네 개의 기저 벡터를 바꿔 같은 스캔 코드를 북/동/남/서 사분면에 재사용한다.
+    x = g_px + col * q.xx + depth * q.xy;
+    y = g_py + col * q.yx + depth * q.yy;
+}
+
+static bool is_symmetric(const ShadowRow& row, int col)
+{
+    // 타일 중심이 현재 스캔 기울기 범위 안에 있으면 대칭적으로 보이는 타일이다.
+    // 벽 타일은 중심이 범위 밖이어도 드러내지만, 바닥 타일은 이 조건을 통과해야 한다.
+    return col >= row.depth * row.start_slope &&
+           col <= row.depth * row.end_slope;
+}
+
+static void scan_shadow_row(const ShadowQuadrant& q, const ShadowRow& row)
+{
+    if (row.depth > LIGHT_RADIUS || row.start_slope > row.end_slope)
     {
-        int dy = -dist;
-        bool any_in_bounds = false;
+        return;
+    }
 
-        // 가로 방향 조사
-        for (int dx = -dist; dx <= 0; ++dx)
+    const int min_col = round_ties_up(row.depth * row.start_slope);
+    const int max_col = round_ties_down(row.depth * row.end_slope);
+    const int R2 = LIGHT_RADIUS * LIGHT_RADIUS;
+
+    bool has_prev = false;
+    bool prev_blocked = false;
+    ShadowRow next_row = { row.depth + 1, row.start_slope, row.end_slope };
+
+    for (int col = min_col; col <= max_col; ++col)
+    {
+        int tx, ty;
+        transform_quadrant(q, row.depth, col, tx, ty);
+
+        const bool valid = in_bounds(tx, ty);
+        const bool blocked = !valid || blocks_light(g_map[ty][tx]);
+        const bool in_radius = col * col + row.depth * row.depth <= R2;
+
+        // Symmetric Shadowcasting은 벽과 바닥을 다르게 처리한다.
+        // 벽은 그림자의 시작점이라서 보이면 표시하고, 바닥은 중심이 빛 부채꼴 안에 있을 때만 표시한다.
+        if (valid && in_radius && (blocked || is_symmetric(row, col)))
         {
-            int cx = g_px + dx * xx + dy * xy;
-            int cy = g_py + dx * yx + dy * yy;
+            g_visible[ty][tx] = true;
+        }
 
-            // Slopes of this cell's left and right edges (octant-local).
-            double left_slope  = (dx - 0.5) / (dy + 0.5);
-            double right_slope = (dx + 0.5) / (dy - 0.5);
-
-            if (start_slope < right_slope)
+        if (has_prev)
+        {
+            if (prev_blocked && !blocked)
             {
-                continue;
+                // 벽 뒤에서 다시 바닥이 시작되면, 그 바닥의 왼쪽 가장자리부터 새 빛 부채꼴을 연다.
+                next_row.start_slope = tile_slope(row.depth, col);
             }
-            if (end_slope > left_slope)
+            else if (!prev_blocked && blocked)
             {
-                break;
-            }
-
-            bool in_bounds = (cx >= 0 && cx < g_W && cy >= 0 && cy < g_H);
-            if (in_bounds)
-            {
-                any_in_bounds = true;
-                if (dx * dx + dy * dy <= R2)
-                {
-                    g_visible[cy][cx] = true;
-                }
-            }
-
-            bool blocks = in_bounds && blocks_light(g_map[cy][cx]);
-
-            if (prev_blocked)
-            {
-                if (blocks)
-                {
-                    next_start = right_slope;
-                }
-                else
-                {
-                    prev_blocked = false;
-                    start_slope = next_start;
-                }
-            }
-            else
-            {
-                if (blocks && dist < radius)
-                {
-                    prev_blocked = true;
-                    cast_light(dist + 1, start_slope, left_slope, radius,
-                               xx, xy, yx, yy);
-                    next_start = right_slope;
-                }
+                // 바닥에서 벽으로 바뀌는 순간 그림자가 생긴다.
+                // 현재 벽의 왼쪽 가장자리까지만 다음 행을 재귀 스캔한다.
+                ShadowRow visible_part = next_row;
+                visible_part.end_slope = tile_slope(row.depth, col);
+                scan_shadow_row(q, visible_part);
             }
         }
 
-        // If the entire row was out of bounds and we're still scanning, stop.
-        if (!any_in_bounds) break;
-        if (prev_blocked) break;
+        has_prev = true;
+        prev_blocked = blocked;
+    }
+
+    if (has_prev && !prev_blocked)
+    {
+        // 행의 끝까지 열린 공간이면 같은 기울기 범위를 유지한 채 다음 행으로 진행한다.
+        scan_shadow_row(q, next_row);
     }
 }
 
@@ -189,9 +216,22 @@ static void compute_light()
     }
     g_visible[g_py][g_px] = true;
 
-    for (int oct = 0; oct < 8; ++oct)
+    // Symmetric Shadowcasting:
+    // 1. 광원 주변을 북/동/남/서 네 사분면으로 나눈다.
+    // 2. 각 사분면에서 가까운 행부터 멀리 있는 행까지 스캔한다.
+    // 3. 벽을 만나면 다음 행에 넘길 기울기 범위를 잘라 그림자 영역을 만든다.
+    // 기존 방식처럼 모든 타일마다 Bresenham LOS를 다시 긋지 않으므로 분석할 상태가 행/기울기에 집중된다.
+    const ShadowQuadrant quadrants[] =
     {
-        cast_light(1, 1.0, 0.0, LIGHT_RADIUS, OCTANT_XFORM[oct][0], OCTANT_XFORM[oct][1], OCTANT_XFORM[oct][2], OCTANT_XFORM[oct][3]);
+        { 1,  0,  0, -1 }, // 북쪽: depth가 커질수록 y가 감소한다.
+        { 0,  1,  1,  0 }, // 동쪽: depth가 커질수록 x가 증가한다.
+        { 1,  0,  0,  1 }, // 남쪽: depth가 커질수록 y가 증가한다.
+        { 0, -1,  1,  0 }, // 서쪽: depth가 커질수록 x가 감소한다.
+    };
+
+    for (const ShadowQuadrant& q : quadrants)
+    {
+        scan_shadow_row(q, { 1, -1.0, 1.0 });
     }
 }
 
