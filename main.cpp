@@ -1,6 +1,3 @@
-// TraceShadow - console-based light/shadow exploration game
-// Implements concept.txt: keyboard movement, map.txt-based map, light/shadow effect.
-
 #include <windows.h>
 #include <conio.h>
 #include <cstdio>
@@ -64,7 +61,7 @@ static bool load_map(const char* path)
     return true;
 }
 
-static bool find_start(int& sx, int& sy)
+bool find_start(int& sx, int& sy)
 {
     for (int y = 0; y < g_H; ++y)
     {
@@ -81,15 +78,272 @@ static bool find_start(int& sx, int& sy)
     return false;
 }
 
-static inline bool blocks_light(char c)
+inline bool blocks_light(char c)
 {
     return c == '#' || c == '*';
 }
 
-static inline bool blocks_move(char c)
+inline bool blocks_move(char c)
 {
     return c == '#' || c == '*';
 }
+
+void hide_cursor()
+{
+    CONSOLE_CURSOR_INFO ci;
+    ci.dwSize = 1;
+    ci.bVisible = FALSE;
+    SetConsoleCursorInfo(g_hOut, &ci);
+}
+
+void move_cursor_home()
+{
+    COORD c = { 0, 0 };
+    SetConsoleCursorPosition(g_hOut, c);
+}
+
+void try_move(int dx, int dy)
+{
+    int nx = g_px + dx;
+    int ny = g_py + dy;
+    if (nx < 0 || nx >= g_W || ny < 0 || ny >= g_H) 
+        return;
+
+    if (blocks_move(g_map[ny][nx])) 
+        return;
+
+    g_px = nx;
+    g_py = ny;
+}
+
+
+void render()
+{
+    // Build the whole frame into a buffer then write once (no flicker).
+    std::string buf;
+    buf.reserve((g_W + 2) * (g_H + 4));
+
+    buf += "TraceShadow  -  WASD/Arrows: Move,  ESC: Quit\n";
+    char info[128];
+    std::snprintf(info, sizeof(info), "Player: (%d, %d)   Light radius: %d\n",
+        g_px, g_py, LIGHT_RADIUS);
+    buf += info;
+    buf += '\n';
+
+    for (int y = 0; y < g_H; ++y)
+    {
+        for (int x = 0; x < g_W; ++x)
+        {
+            char out;
+            if (x == g_px && y == g_py)
+            {
+                out = '@';
+            }
+            else if (!g_visible[y][x])
+            {
+                out = ' ';
+            }
+            else
+            {
+                char m = g_map[y][x];
+                if (m == ' ')
+                {
+                    out = '.';
+                }
+                else
+                {
+                    out = m;  // '#' or '*' shown as-is
+                }
+            }
+            buf += out;
+        }
+        buf += '\n';
+    }
+    buf += '\n';
+    buf += "Lit empty cells appear as '.'  Walls/obstacles block the light.\n";
+
+    move_cursor_home();
+    DWORD written = 0;
+    WriteConsoleA(g_hOut, buf.data(), (DWORD)buf.size(), &written, NULL);
+}
+
+
+#if 1
+
+/*
+    Axis
+           | -
+           |
+    -      |       +  
+    -------+-------
+           |
+           |
+           | +
+*/ 
+
+
+
+#define UP      0
+#define RIGHT   1
+#define DOWN    2
+#define LEFT    3
+#define DIR_COUNT   4
+
+
+void scan_shadow(int depth, int direction, double start_slope, double end_slope)
+{
+    if( depth > LIGHT_RADIUS )
+		return;
+
+    int min_col = (int)ceil(depth * start_slope);
+    int max_col = (int)floor(depth * end_slope);
+    for (int col = min_col; col <= max_col; ++col)
+    {
+        int tx, ty;
+        switch (direction)
+        {
+            case UP:
+                tx = g_px + col;
+                ty = g_py - depth;
+                break;
+            case RIGHT:
+                tx = g_px + depth;
+                ty = g_py + col;
+                break;
+            case DOWN:
+                tx = g_px + col;
+                ty = g_py + depth;
+                break;
+            case LEFT:
+                tx = g_px - depth;
+                ty = g_py + col;
+                break;
+            default:
+                return;
+        }
+
+        if (tx < 0 || tx >= g_W || ty < 0 || ty >= g_H)
+        {
+            continue;  // Out of bounds
+        }
+
+        bool blocked = blocks_light(g_map[ty][tx]);
+        bool in_radius = (col * col + depth * depth) <= (LIGHT_RADIUS * LIGHT_RADIUS);
+        if (in_radius && (blocked || (col >= depth * start_slope && col <= depth * end_slope)))
+        {
+            g_visible[ty][tx] = true;
+        }
+        if (blocked)
+        {
+            if (start_slope == -1)
+            {
+                start_slope = ((2.0 * col - 1.0) / (2.0 * depth));
+            }
+            else
+            {
+                end_slope = ((2.0 * col + 1.0) / (2.0 * depth));
+                scan_shadow(depth + 1, direction, start_slope, end_slope);
+                start_slope = -1;  // Reset
+            }
+        }
+    }
+    if (start_slope != -1)
+    {
+        scan_shadow(depth + 1, direction, start_slope, end_slope);
+	}
+
+}
+
+
+void compute_light()
+{
+    for (int y = 0; y < g_H; ++y)
+    {
+        for (int x = 0; x < g_W; ++x)
+        {
+            g_visible[y][x] = false;
+        }
+    }
+    g_visible[g_py][g_px] = true;
+
+    int direction = UP;
+
+    for (int d = UP; d < DIR_COUNT; d++)
+        scan_shadow(1, d, -1.0, 1.0);
+}
+
+int main()
+{
+    g_hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    if (!load_map("map.txt"))
+    {
+        std::printf("Cannot open map.txt. Make sure map.txt is in the working directory.\n");
+        std::printf("Press any key to exit...\n");
+        _getch();
+        return 1;
+    }
+
+    if (!find_start(g_px, g_py))
+    {
+        std::printf("No empty starting cell found in the map.\n");
+        _getch();
+        return 1;
+    }
+
+    hide_cursor();
+    // Clear once so any leftover terminal text doesn't bleed into the frame.
+    system("cls");
+
+    compute_light();
+    render();
+
+    while (true)
+    {
+        int k = _getch();
+        if (k == 27) break;  // ESC
+
+        int dx = 0, dy = 0;
+        if (k == 0 || k == 224)
+        {
+            int k2 = _getch();
+            switch (k2)
+            {
+            case 72: dy = -1; break;  // Up
+            case 80: dy = +1; break;  // Down
+            case 75: dx = -1; break;  // Left
+            case 77: dx = +1; break;  // Right
+            default: break;
+            }
+        }
+        else
+        {
+            switch (k)
+            {
+            case 'w': case 'W': dy = -1; break;
+            case 's': case 'S': dy = +1; break;
+            case 'a': case 'A': dx = -1; break;
+            case 'd': case 'D': dx = +1; break;
+            case 'q': case 'Q': return 0;
+            default: break;
+            }
+        }
+
+        if (dx != 0 || dy != 0)
+        {
+            try_move(dx, dy);
+            compute_light();
+            render();
+        }
+    }
+
+    move_cursor_home();
+    std::printf("\nBye.\n");
+    return 0;
+}
+
+
+#else
 
 struct ShadowQuadrant
 {
@@ -142,8 +396,7 @@ static bool is_symmetric(const ShadowRow& row, int col)
 {
     // 타일 중심이 현재 스캔 기울기 범위 안에 있으면 대칭적으로 보이는 타일이다.
     // 벽 타일은 중심이 범위 밖이어도 드러내지만, 바닥 타일은 이 조건을 통과해야 한다.
-    return col >= row.depth * row.start_slope &&
-           col <= row.depth * row.end_slope;
+    return col >= row.depth * row.start_slope && col <= row.depth * row.end_slope;
 }
 
 static void scan_shadow_row(const ShadowQuadrant& q, const ShadowRow& row)
@@ -220,7 +473,6 @@ static void compute_light()
     // 1. 광원 주변을 북/동/남/서 네 사분면으로 나눈다.
     // 2. 각 사분면에서 가까운 행부터 멀리 있는 행까지 스캔한다.
     // 3. 벽을 만나면 다음 행에 넘길 기울기 범위를 잘라 그림자 영역을 만든다.
-    // 기존 방식처럼 모든 타일마다 Bresenham LOS를 다시 긋지 않으므로 분석할 상태가 행/기울기에 집중된다.
     const ShadowQuadrant quadrants[] =
     {
         { 1,  0,  0, -1 }, // 북쪽: depth가 커질수록 y가 감소한다.
@@ -235,79 +487,7 @@ static void compute_light()
     }
 }
 
-static void hide_cursor()
-{
-    CONSOLE_CURSOR_INFO ci;
-    ci.dwSize = 1;
-    ci.bVisible = FALSE;
-    SetConsoleCursorInfo(g_hOut, &ci);
-}
 
-static void move_cursor_home()
-{
-    COORD c = {0, 0};
-    SetConsoleCursorPosition(g_hOut, c);
-}
-
-static void render()
-{
-    // Build the whole frame into a buffer then write once (no flicker).
-    std::string buf;
-    buf.reserve((g_W + 2) * (g_H + 4));
-
-    buf += "TraceShadow  -  WASD/Arrows: Move,  ESC: Quit\n";
-    char info[128];
-    std::snprintf(info, sizeof(info), "Player: (%d, %d)   Light radius: %d\n",
-                  g_px, g_py, LIGHT_RADIUS);
-    buf += info;
-    buf += '\n';
-
-    for (int y = 0; y < g_H; ++y)
-    {
-        for (int x = 0; x < g_W; ++x)
-        {
-            char out;
-            if (x == g_px && y == g_py)
-            {
-                out = '@';
-            }
-            else if (!g_visible[y][x])
-            {
-                out = ' ';
-            }
-            else
-            {
-                char m = g_map[y][x];
-                if (m == ' ')
-                {
-                    out = '.';
-                }
-                else
-                {
-                    out = m;  // '#' or '*' shown as-is
-                }
-            }
-            buf += out;
-        }
-        buf += '\n';
-    }
-    buf += '\n';
-    buf += "Lit empty cells appear as '.'  Walls/obstacles block the light.\n";
-
-    move_cursor_home();
-    DWORD written = 0;
-    WriteConsoleA(g_hOut, buf.data(), (DWORD)buf.size(), &written, NULL);
-}
-
-static void try_move(int dx, int dy)
-{
-    int nx = g_px + dx;
-    int ny = g_py + dy;
-    if (nx < 0 || nx >= g_W || ny < 0 || ny >= g_H) return;
-    if (blocks_move(g_map[ny][nx])) return;
-    g_px = nx;
-    g_py = ny;
-}
 
 int main()
 {
@@ -378,3 +558,5 @@ int main()
     std::printf("\nBye.\n");
     return 0;
 }
+
+#endif
